@@ -1,15 +1,14 @@
 /**
  * Billy.sh Cloudflare Worker
- * Receives Lemon Squeezy webhooks on payment and emails a signed license key.
+ * Handles Lemon Squeezy webhooks, promo code validation, and admin endpoints.
  *
  * Required CF secrets (set via wrangler secret put):
  *   BILLY_PRIVATE_KEY    - Ed25519 private key base64
  *   LEMON_SQUEEZY_SECRET - webhook signing secret
  *   RESEND_API_KEY       - for sending email
+ *   ADMIN_SECRET         - for /admin/* endpoints
  */
 
-// Tier mapping from Lemon Squeezy variant IDs
-// Update these IDs after creating products in Lemon Squeezy
 const VARIANT_TIERS: Record<string, string> = {
   "pro_monthly":     "pro",
   "pro_onetime":     "pro",
@@ -30,43 +29,89 @@ interface Env {
   BILLY_PRIVATE_KEY: string;
   LEMON_SQUEEZY_SECRET: string;
   RESEND_API_KEY: string;
+  ADMIN_SECRET: string;
+  BILLY_KV: KVNamespace;
 }
+
+const corsHeaders = {
+  'Content-Type': 'application/json',
+  'Access-Control-Allow-Origin': 'https://jd4rider.github.io',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Secret',
+};
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    if (request.method !== "POST") {
-      return new Response("Method not allowed", { status: 405 });
+    const url = new URL(request.url);
+
+    // CORS preflight
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    // Promo code validation
+    if (url.pathname === '/validate-promo' && request.method === 'POST') {
+      const { code } = await request.json() as { code: string };
+      const storedDiscount = await env.BILLY_KV.get(`promo:${code.toUpperCase()}`);
+      if (!storedDiscount) {
+        return new Response(JSON.stringify({ valid: false, message: 'Invalid promo code' }), {
+          status: 200, headers: corsHeaders,
+        });
+      }
+      return new Response(JSON.stringify({ valid: true, discount: storedDiscount, message: `${storedDiscount}% off applied!` }), {
+        status: 200, headers: corsHeaders,
+      });
+    }
+
+    // Admin: create promo code (protected by X-Admin-Secret header)
+    if (url.pathname === '/admin/promo' && request.method === 'POST') {
+      const adminSecret = request.headers.get('X-Admin-Secret');
+      if (adminSecret !== env.ADMIN_SECRET) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      const { code, discount, maxUses } = await request.json() as { code: string; discount: number; maxUses?: number };
+      await env.BILLY_KV.put(`promo:${code.toUpperCase()}`, String(discount), {
+        metadata: { maxUses: maxUses || 999, uses: 0, created: new Date().toISOString() },
+      });
+      return new Response(JSON.stringify({ created: true, code: code.toUpperCase(), discount }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // Lemon Squeezy webhook handler
+    if (request.method !== 'POST') {
+      return new Response('Method not allowed', { status: 405 });
     }
 
     const body = await request.text();
 
     // Verify Lemon Squeezy signature
-    const sig = request.headers.get("X-Signature");
+    const sig = request.headers.get('X-Signature');
     if (!sig || !(await verifySignature(body, sig, env.LEMON_SQUEEZY_SECRET))) {
-      return new Response("Invalid signature", { status: 401 });
+      return new Response('Invalid signature', { status: 401 });
     }
 
     const event = JSON.parse(body);
     const eventName = event.meta?.event_name;
 
-    if (eventName !== "order_created" && eventName !== "subscription_created") {
-      return new Response("Ignored", { status: 200 });
+    if (eventName !== 'order_created' && eventName !== 'subscription_created') {
+      return new Response('Ignored', { status: 200 });
     }
 
     const data = event.data?.attributes;
     const email = data?.user_email;
     const variantName =
-      data?.first_order_item?.variant_name?.toLowerCase().replace(/\s+/g, "_") ||
-      data?.variant_name?.toLowerCase().replace(/\s+/g, "_") ||
-      "pro_onetime";
+      data?.first_order_item?.variant_name?.toLowerCase().replace(/\s+/g, '_') ||
+      data?.variant_name?.toLowerCase().replace(/\s+/g, '_') ||
+      'pro_onetime';
 
-    const tier = VARIANT_TIERS[variantName] ?? "pro";
+    const tier = VARIANT_TIERS[variantName] ?? 'pro';
     const seats = VARIANT_SEATS[variantName] ?? 0;
 
     const key = await generateLicenseKey(env.BILLY_PRIVATE_KEY, email, tier, seats);
     await sendEmail(env.RESEND_API_KEY, email, tier, key);
 
-    return new Response("OK", { status: 200 });
+    return new Response('OK', { status: 200 });
   },
 };
 
