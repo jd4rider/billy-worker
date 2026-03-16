@@ -33,20 +33,39 @@ interface Env {
   BILLY_KV: KVNamespace;
 }
 
-const corsHeaders = {
-  'Content-Type': 'application/json',
-  'Access-Control-Allow-Origin': 'https://jd4rider.github.io',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Secret',
-};
+function getCorsHeaders(origin: string | null) {
+  const allowed = [
+    'https://jd4rider.github.io',
+    'http://localhost:3000',
+    'http://localhost:3001',
+  ];
+  const allowOrigin = (origin && allowed.includes(origin)) ? origin : allowed[0];
+  return {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': allowOrigin,
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Secret',
+    'Vary': 'Origin',
+  };
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    const origin = request.headers.get('Origin');
+    const corsHeaders = getCorsHeaders(origin);
+
     // CORS preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders });
+    }
+
+    // Health check
+    if (url.pathname === '/health') {
+      return new Response(JSON.stringify({ status: 'ok', version: '0.1.0' }), {
+        status: 200, headers: getCorsHeaders(null),
+      });
     }
 
     // Promo code validation
@@ -178,7 +197,7 @@ async function sendEmail(
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      from: "Billy.sh <noreply@billy.sh>",
+      from: "Billy.sh <onboarding@resend.dev>",
       to: email,
       subject: `Your Billy.sh ${tierLabel} License Key`,
       html: `
