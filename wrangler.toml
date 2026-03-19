@@ -3,18 +3,13 @@ main = "src/index.ts"
 compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
 
-# After running: wrangler kv namespace create BILLY_KV
-# paste the returned id and preview_id below
 [[kv_namespaces]]
 binding = "BILLY_KV"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
-preview_id = "REPLACE_WITH_KV_PREVIEW_ID"
+id = "23c61f9490f24921ab281656f04bb1b1"
+preview_id = "2dfc64674b874af295f9ccf54507c1f7"
 
 [vars]
 WORKER_ENV = "production"
 
 # Set secrets via CLI (never commit values):
-#   wrangler secret put BILLY_PRIVATE_KEY
-#   wrangler secret put LEMON_SQUEEZY_SECRET
-#   wrangler secret put RESEND_API_KEY
 #   wrangler secret put ADMIN_SECRET
