@@ -9,20 +9,29 @@
  *   ADMIN_SECRET         - for /admin/* endpoints
  */
 
-const VARIANT_TIERS: Record<string, string> = {
-  "pro_monthly":     "pro",
-  "pro_onetime":     "pro",
-  "premium_monthly": "premium",
-  "premium_onetime": "premium",
-  "team_5":          "team",
-  "team_10":         "team",
-  "team_25":         "team",
+// Keyed by numeric Lemon Squeezy variant ID (more reliable than name).
+const VARIANT_TIERS: Record<number, string> = {
+  // Test-mode variants
+  1408429: "pro",      // Billy Pro (test)
+  1408393: "premium",  // Billy Premium (test)
+  1408425: "team",     // Billy Teams 5 Seat (test)
+  1408426: "team",     // Billy Teams 10 Seat (test)
+  1408428: "team",     // Billy Teams 25 Seat (test)
+  // Live-mode variants
+  1420712: "pro",      // Billy Pro (live)
+  1420713: "premium",  // Billy Premium (live)
+  1420715: "team",     // Billy Teams 5 Seat (live)
+  1420716: "team",     // Billy Teams 10 Seat (live)
+  1420717: "team",     // Billy Teams 25 Seat (live)
 };
 
-const VARIANT_SEATS: Record<string, number> = {
-  "team_5":  5,
-  "team_10": 10,
-  "team_25": 25,
+const VARIANT_SEATS: Record<number, number> = {
+  1408425: 5,
+  1408426: 10,
+  1408428: 25,
+  1420715: 5,
+  1420716: 10,
+  1420717: 25,
 };
 
 interface Env {
@@ -65,6 +74,24 @@ export default {
     if (url.pathname === '/health') {
       return new Response(JSON.stringify({ status: 'ok', version: '0.1.0' }), {
         status: 200, headers: getCorsHeaders(null),
+      });
+    }
+
+    // Newsletter subscribe
+    if (url.pathname === '/subscribe' && request.method === 'POST') {
+      const body2 = await request.json() as { email?: string };
+      const subEmail = (body2.email || '').trim().toLowerCase();
+      if (!subEmail || !subEmail.includes('@') || !subEmail.includes('.')) {
+        return new Response(JSON.stringify({ ok: false, message: 'Please provide a valid email address.' }), {
+          status: 400, headers: corsHeaders,
+        });
+      }
+      await env.BILLY_KV.put(`subscriber:${subEmail}`, JSON.stringify({
+        email: subEmail,
+        subscribedAt: new Date().toISOString(),
+      }));
+      return new Response(JSON.stringify({ ok: true, message: "You're subscribed! We'll notify you when Billy ships new features." }), {
+        status: 200, headers: corsHeaders,
       });
     }
 
@@ -112,25 +139,33 @@ export default {
 
     const event = JSON.parse(body);
     const eventName = event.meta?.event_name;
+    const testMode: boolean = event.meta?.test_mode === true;
 
     if (eventName !== 'order_created' && eventName !== 'subscription_created') {
       return new Response('Ignored', { status: 200 });
     }
 
     const data = event.data?.attributes;
-    const email = data?.user_email;
-    const variantName =
-      data?.first_order_item?.variant_name?.toLowerCase().replace(/\s+/g, '_') ||
-      data?.variant_name?.toLowerCase().replace(/\s+/g, '_') ||
-      'pro_onetime';
+    // In test mode, redirect all emails to the store owner for verification
+    const customerEmail = data?.user_email;
+    const email = testMode ? 'jd4rider@gmail.com' : customerEmail;
+    const variantId: number =
+      data?.first_order_item?.variant_id ||
+      data?.variant_id ||
+      0;
 
-    const tier = VARIANT_TIERS[variantName] ?? 'pro';
-    const seats = VARIANT_SEATS[variantName] ?? 0;
+    const tier = VARIANT_TIERS[variantId] ?? 'pro';
+    const seats = VARIANT_SEATS[variantId] ?? 0;
 
-    const key = await generateLicenseKey(env.BILLY_PRIVATE_KEY, email, tier, seats);
-    await sendEmail(env.RESEND_API_KEY, email, tier, key);
-
-    return new Response('OK', { status: 200 });
+    try {
+      const key = await generateLicenseKey(env.BILLY_PRIVATE_KEY, email, tier, seats);
+      await sendEmail(env.RESEND_API_KEY, email, tier, key, testMode);
+      return new Response('OK', { status: 200 });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('Webhook handler error:', msg);
+      return new Response(`Internal error: ${msg}`, { status: 500 });
+    }
   },
 };
 
@@ -155,11 +190,21 @@ async function generateLicenseKey(
   seats: number
 ): Promise<string> {
   const privBytes = base64ToBytes(privKeyB64);
-  // Ed25519 private key: first 32 bytes = seed, import as raw
   const seed = privBytes.slice(0, 32);
+
+  // CF Workers WebCrypto requires PKCS8 format for Ed25519 private key import.
+  // PKCS8 DER wrapper for Ed25519: 30 2e 02 01 00 30 05 06 03 2b 65 70 04 22 04 20 + 32 seed bytes
+  const pkcs8Prefix = new Uint8Array([
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
+    0x04, 0x22, 0x04, 0x20,
+  ]);
+  const pkcs8 = new Uint8Array(pkcs8Prefix.length + seed.length);
+  pkcs8.set(pkcs8Prefix);
+  pkcs8.set(seed, pkcs8Prefix.length);
+
   const cryptoKey = await crypto.subtle.importKey(
-    "raw",
-    seed,
+    "pkcs8",
+    pkcs8,
     { name: "Ed25519" },
     false,
     ["sign"]
@@ -187,7 +232,8 @@ async function sendEmail(
   apiKey: string,
   email: string,
   tier: string,
-  key: string
+  key: string,
+  testMode = false
 ): Promise<void> {
   const tierLabel = tier.charAt(0).toUpperCase() + tier.slice(1);
   await fetch("https://api.resend.com/emails", {
@@ -199,16 +245,23 @@ async function sendEmail(
     body: JSON.stringify({
       from: "Billy.sh <onboarding@resend.dev>",
       to: email,
-      subject: `Your Billy.sh ${tierLabel} License Key`,
+      subject: `${testMode ? '[TEST] ' : ''}Your Billy.sh ${tierLabel} License Key`,
       html: `
         <h2>Welcome to Billy.sh ${tierLabel}! 🐐</h2>
+        <p style="background:#fffbeb;border-left:4px solid #f59e0b;padding:12px 16px;border-radius:4px;">
+          📬 <strong>This email is from <code>onboarding@resend.dev</code>.</strong><br>
+          If you don't see it in your inbox, please check your <strong>spam or junk folder</strong>
+          and mark it as "Not Spam" so future emails arrive safely.
+        </p>
         <p>Your license key:</p>
-        <pre style="background:#0d1117;color:#38bdf8;padding:16px;border-radius:8px;font-size:14px;">${key}</pre>
+        <pre style="background:#0d1117;color:#38bdf8;padding:16px;border-radius:8px;font-size:14px;word-break:break-all;">${key}</pre>
         <p>Activate in your terminal:</p>
-        <pre style="background:#0d1117;color:#f8f8f2;padding:16px;border-radius:8px;">/license ${key}</pre>
+        <pre style="background:#0d1117;color:#f8f8f2;padding:16px;border-radius:8px;">1. Run billy in your terminal
+2. Type: /activate
+3. Paste your key when prompted</pre>
         <p>Thank you for supporting Billy.sh!</p>
         <hr>
-        <small>Need help? Reply to this email.</small>
+        <small>Need help? Reply to this email or visit <a href="https://billy.sh">billy.sh</a>.</small>
       `,
     }),
   });
