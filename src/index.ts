@@ -3,11 +3,13 @@
  * Handles newsletter signups, promo code validation, and admin endpoints.
  *
  * Required CF secrets (set via wrangler secret put):
- *   ADMIN_SECRET - for /admin/* endpoints
+ *   ADMIN_SECRET      - for /admin/* endpoints
+ *   RESEND_API_KEY    - for /admin/send-email
  */
 
 interface Env {
   ADMIN_SECRET: string;
+  RESEND_API_KEY: string;
   BILLY_KV: KVNamespace;
 }
 
@@ -85,6 +87,74 @@ export default {
         metadata: { maxUses: maxUses || 999, uses: 0, created: new Date().toISOString() },
       });
       return new Response(JSON.stringify({ created: true, code: code.toUpperCase(), discount }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // Admin: add a domain to Resend and get DNS records
+    if (url.pathname === '/admin/resend/domain' && request.method === 'POST') {
+      if (request.headers.get('X-Admin-Secret') !== env.ADMIN_SECRET) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      const { name } = await request.json() as { name: string };
+      const res = await fetch('https://api.resend.com/domains', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      const data = await res.json();
+      return new Response(JSON.stringify(data), { status: res.status, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // Admin: list Resend domains
+    if (url.pathname === '/admin/resend/domains' && request.method === 'GET') {
+      if (request.headers.get('X-Admin-Secret') !== env.ADMIN_SECRET) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      const res = await fetch('https://api.resend.com/domains', {
+        headers: { 'Authorization': `Bearer ${env.RESEND_API_KEY}` },
+      });
+      const data = await res.json();
+      return new Response(JSON.stringify(data), { status: res.status, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // Admin: send a transactional email via Resend
+    if (url.pathname === '/admin/send-email' && request.method === 'POST') {
+      if (request.headers.get('X-Admin-Secret') !== env.ADMIN_SECRET) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      const { to, subject, text, html } = await request.json() as {
+        to: string;
+        subject: string;
+        text: string;
+        html?: string;
+      };
+      if (!to || !subject || !text) {
+        return new Response(JSON.stringify({ ok: false, message: 'Missing required fields: to, subject, text' }), {
+          status: 400, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      const resendRes = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${env.RESEND_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          from: 'Billy.sh <onboarding@resend.dev>',
+          to: [to],
+          subject,
+          text,
+          ...(html ? { html } : {}),
+        }),
+      });
+      const resendData = await resendRes.json() as { id?: string; name?: string; message?: string };
+      if (!resendRes.ok) {
+        return new Response(JSON.stringify({ ok: false, error: resendData }), {
+          status: 502, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ ok: true, id: resendData.id }), {
         status: 200, headers: { 'Content-Type': 'application/json' },
       });
     }
