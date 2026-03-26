@@ -5,11 +5,13 @@
  * Required CF secrets (set via wrangler secret put):
  *   ADMIN_SECRET      - for /admin/* endpoints
  *   RESEND_API_KEY    - for /admin/send-email
+ *   RESEND_FROM       - optional sender override, e.g. Billy <noreply@send.billysh.online>
  */
 
 interface Env {
   ADMIN_SECRET: string;
   RESEND_API_KEY: string;
+  RESEND_FROM?: string;
   BILLY_KV: KVNamespace;
 }
 
@@ -141,7 +143,7 @@ export default {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          from: 'Billy.sh <onboarding@resend.dev>',
+          from: env.RESEND_FROM || 'Billy <hello@jd4codes.com>',
           to: [to],
           subject,
           text,
